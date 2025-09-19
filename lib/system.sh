@@ -51,6 +51,22 @@ ensure_core_dependencies() {
   fi
 }
 
+report_core_dependencies() {
+  local dep
+  local missing=()
+  for dep in curl git wget; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+      missing+=("$dep")
+    fi
+  done
+
+  if (( ${#missing[@]} )); then
+    log_error "Missing core dependencies: ${missing[*]}"
+  else
+    log_success "All core dependencies (curl, git, wget) are present."
+  fi
+}
+
 ensure_local_bin() {
   mkdir -p "$HOME/.local/bin"
 }

@@ -3,8 +3,8 @@
 # Installer functions for toolchain setup
 
 system_update_and_base_deps() {
-  run "sudo apt update -y && sudo apt upgrade -y"
-  run "sudo apt install -y build-essential pkg-config libssl-dev ca-certificates gnupg lsb-release software-properties-common unattended-upgrades"
+  time_step "apt update/upgrade" bash -lc "sudo apt update -y && sudo apt upgrade -y"
+  time_step "base packages" sudo apt install -y build-essential pkg-config libssl-dev ca-certificates gnupg lsb-release software-properties-common unattended-upgrades
   run "loginctl enable-linger $USER || true"
 }
 
@@ -19,7 +19,21 @@ install_fish_shell() {
 
 install_rust_toolchain() {
   if ! command -v rustc &>/dev/null; then
-    run "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+    local rustup_installer
+    local rustup_tmp=""
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+      log_info "[Dry-run] Download rustup installer from https://sh.rustup.rs"
+      rustup_installer="/tmp/rustup-init.sh"
+    else
+      rustup_tmp=$(mktemp -d)
+      TMPDIRS+=("$rustup_tmp")
+      rustup_installer="$rustup_tmp/rustup-init.sh"
+      download_with_retry "https://sh.rustup.rs" "$rustup_installer" 3 30 "--proto" "=https" "--tlsv1.2"
+    fi
+    run "sh \"$rustup_installer\" -s -- -y"
+    if [[ "${DRY_RUN:-false}" != true ]]; then
+      rm -f "$rustup_installer"
+    fi
     if [[ "${DRY_RUN:-false}" != true && -f "$HOME/.cargo/env" ]]; then
       # shellcheck disable=SC1091
       source "$HOME/.cargo/env"
@@ -28,12 +42,31 @@ install_rust_toolchain() {
   run "cargo install cargo-update || true"
 }
 
+docker_repo_setup_commands() {
+  local key_tmp="$1"
+  sudo install -m 0755 -d /etc/apt/keyrings
+  sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg "$key_tmp"
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+}
+
+docker_package_install() {
+  sudo apt update -y
+  sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+}
+
 setup_docker() {
   if ! command -v docker &>/dev/null; then
-    run "sudo install -m 0755 -d /etc/apt/keyrings"
-    run "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg"
-    run 'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null'
-    run "sudo apt update -y && sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+    local docker_key_tmp
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+      log_info "[Dry-run] Download Docker GPG key"
+      docker_key_tmp="/tmp/docker.gpg"
+    else
+      docker_key_tmp=$(mktemp)
+      TMPDIRS+=("$docker_key_tmp")
+      download_with_retry "https://download.docker.com/linux/ubuntu/gpg" "$docker_key_tmp" 3 30
+    fi
+    time_step "Docker repo setup" docker_repo_setup_commands "$docker_key_tmp"
+    time_step "Docker packages" docker_package_install
     run "sudo usermod -aG docker $USER"
   fi
 }
@@ -47,8 +80,25 @@ install_lazydocker_suite() {
 install_lazydocker() {
   ensure_local_bin
   local BIN="$HOME/.local/bin/lazydocker"
-  local LATEST
-  LATEST=$(curl -s https://api.github.com/repos/jesseduffield/lazydocker/releases/latest | grep -Po '"tag_name": "v\K[0-9.]+' )
+  local user_agent="setup-script/${SCRIPT_VERSION:-1.0}"
+  local -a gh_headers=("-H" "Accept: application/vnd.github+json" "-H" "User-Agent: ${user_agent}")
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    gh_headers+=("-H" "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  local release_meta
+  release_meta=$(fetch_with_retry "https://api.github.com/repos/jesseduffield/lazydocker/releases/latest" 3 15 "${gh_headers[@]}") || release_meta=""
+  local LATEST=""
+  if [[ -n "$release_meta" ]]; then
+    LATEST=$(grep -Po '"tag_name": "v\K[0-9.]+' <<<"$release_meta" || true)
+  fi
+  if [[ -z "$LATEST" ]]; then
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+      log_info "Dry-run: skipping LazyDocker latest version detection."
+      LATEST="0.0.0"
+    else
+      log_error_exit "Unable to determine LazyDocker latest release." "$E_NETWORK"
+    fi
+  fi
   local CURRENT=""
   [[ -x "$BIN" ]] && CURRENT="$("$BIN" --version 2>/dev/null | grep -Po '[0-9.]+' || true)"
   if [[ "$CURRENT" == "$LATEST" ]]; then
@@ -64,7 +114,7 @@ install_lazydocker() {
     *) log_error_exit "Unsupported arch: $ARCH" "$E_UNSUPPORTED_ARCH" ;;
   esac
   local TMP; TMP=$(mktemp -d); TMPDIRS+=("$TMP")
-  run "curl -L https://github.com/jesseduffield/lazydocker/releases/download/v${LATEST}/lazydocker_${LATEST}_${LAZY_ARCH}.tar.gz -o $TMP/lazydocker.tar.gz"
+  download_with_retry "https://github.com/jesseduffield/lazydocker/releases/download/v${LATEST}/lazydocker_${LATEST}_${LAZY_ARCH}.tar.gz" "$TMP/lazydocker.tar.gz" 3 60
   run "tar -xzf $TMP/lazydocker.tar.gz -C $TMP"
   run "mv $TMP/lazydocker \"$BIN\""
   run "chmod +x \"$BIN\""
@@ -75,8 +125,25 @@ install_lazydocker() {
 install_fzf() {
   ensure_local_bin
   local BIN="$HOME/.local/bin/fzf"
-  local LATEST
-  LATEST=$(curl -s https://api.github.com/repos/junegunn/fzf/releases/latest | grep -Po '"tag_name": "v\K[0-9.]+' )
+  local user_agent="setup-script/${SCRIPT_VERSION:-1.0}"
+  local -a gh_headers=("-H" "Accept: application/vnd.github+json" "-H" "User-Agent: ${user_agent}")
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    gh_headers+=("-H" "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  local release_meta
+  release_meta=$(fetch_with_retry "https://api.github.com/repos/junegunn/fzf/releases/latest" 3 15 "${gh_headers[@]}") || release_meta=""
+  local LATEST=""
+  if [[ -n "$release_meta" ]]; then
+    LATEST=$(grep -Po '"tag_name": "v\K[0-9.]+' <<<"$release_meta" || true)
+  fi
+  if [[ -z "$LATEST" ]]; then
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+      log_info "Dry-run: skipping fzf latest version detection."
+      LATEST="0.0.0"
+    else
+      log_error_exit "Unable to determine fzf latest release." "$E_NETWORK"
+    fi
+  fi
   local CURRENT=""
   [[ -x "$BIN" ]] && CURRENT="$("$BIN" --version 2>/dev/null | awk '{print $1}' || true)"
   if [[ "$CURRENT" == "$LATEST" ]]; then
@@ -92,7 +159,7 @@ install_fzf() {
     *) log_error_exit "Unsupported arch: $ARCH" "$E_UNSUPPORTED_ARCH" ;;
   esac
   local TMP; TMP=$(mktemp -d); TMPDIRS+=("$TMP")
-  run "curl -L https://github.com/junegunn/fzf/releases/download/v${LATEST}/fzf-${LATEST}-${FZF_ARCH}.tar.gz -o $TMP/fzf.tar.gz"
+  download_with_retry "https://github.com/junegunn/fzf/releases/download/v${LATEST}/fzf-${LATEST}-${FZF_ARCH}.tar.gz" "$TMP/fzf.tar.gz" 3 60
   run "tar -xzf $TMP/fzf.tar.gz -C $TMP"
   run "mv $TMP/fzf \"$BIN\""
   run "chmod +x \"$BIN\""
@@ -105,8 +172,87 @@ install_updater_scripts() {
   write_file "$HOME/.local/bin/update-lazydocker" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
+
+download_with_retry() {
+  local url="$1"
+  local dest="$2"
+  local retries="${3:-3}"
+  local timeout="${4:-30}"
+  local attempt delay
+  local -a extra_opts=()
+  (( $# > 4 )) && extra_opts=("${@:5}")
+
+  if command -v curl >/dev/null 2>&1; then
+    for (( attempt=1; attempt<=retries; attempt++ )); do
+      rm -f "$dest"
+      if curl --fail --location --silent --show-error --connect-timeout "$timeout" --max-time "$((timeout*2))" "${extra_opts[@]}" -o "$dest" "$url"; then
+        return 0
+      fi
+      if (( attempt < retries )); then
+        delay=$(( (2 ** (attempt-1)) * 2 ))
+        sleep "$delay"
+      fi
+    done
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    if (( ${#extra_opts[@]} > 0 )); then
+      echo "Note: wget fallback ignoring extra curl opts: ${extra_opts[*]}" >&2
+    fi
+    for (( attempt=1; attempt<=retries; attempt++ )); do
+      rm -f "$dest"
+      if wget --quiet --timeout="$timeout" --tries=1 -O "$dest" "$url"; then
+        return 0
+      fi
+      if (( attempt < retries )); then
+        delay=$(( (2 ** (attempt-1)) * 2 ))
+        sleep "$delay"
+      fi
+    done
+  fi
+
+  echo "Failed to download $url after $retries attempts" >&2
+  return 1
+}
+
+fetch_with_retry() {
+  local url="$1"
+  local retries="${2:-3}"
+  local timeout="${3:-15}"
+  local -a extra_opts=()
+  if (( $# > 3 )); then
+    extra_opts=("${@:4}")
+  fi
+  local tmp
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' RETURN
+  download_with_retry "$url" "$tmp" "$retries" "$timeout" "${extra_opts[@]}"
+  cat "$tmp"
+  trap - RETURN
+  rm -f "$tmp"
+}
+
+if [[ "${1:-}" == "--check" ]]; then
+  if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+    if ! command -v tar >/dev/null 2>&1; then
+      echo "update-lazydocker: required command 'tar' not found" >&2
+      exit 1
+    fi
+    echo "update-lazydocker: prerequisites satisfied"
+    exit 0
+  else
+    echo "update-lazydocker: missing curl or wget" >&2
+    exit 1
+  fi
+fi
+
 BIN="$HOME/.local/bin/lazydocker"
-LATEST=$(curl -s https://api.github.com/repos/jesseduffield/lazydocker/releases/latest | grep -Po '"tag_name": "v\K[0-9.]+' )
+HEADERS=("-H" "Accept: application/vnd.github+json" "-H" "User-Agent: setup-script/${SCRIPT_VERSION:-1.0}")
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  HEADERS+=("-H" "Authorization: Bearer ${GITHUB_TOKEN}")
+fi
+LATEST=$(fetch_with_retry "https://api.github.com/repos/jesseduffield/lazydocker/releases/latest" 3 15 "${HEADERS[@]}" | grep -Po '"tag_name": "v\K[0-9.]+' || true)
+[[ -z "$LATEST" ]] && { echo "Unable to determine latest LazyDocker release" >&2; exit 1; }
 CURRENT=""
 [[ -x "$BIN" ]] && CURRENT="$("$BIN" --version 2>/dev/null | grep -Po '[0-9.]+' || true)"
 [[ "$CURRENT" == "$LATEST" ]] && exit 0
@@ -118,7 +264,7 @@ case "$ARCH" in
 esac
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-curl -L "https://github.com/jesseduffield/lazydocker/releases/download/v${LATEST}/lazydocker_${LATEST}_${LAZY_ARCH}.tar.gz" -o "$TMP/lazydocker.tar.gz"
+download_with_retry "https://github.com/jesseduffield/lazydocker/releases/download/v${LATEST}/lazydocker_${LATEST}_${LAZY_ARCH}.tar.gz" "$TMP/lazydocker.tar.gz" 3 60
 tar -xzf "$TMP/lazydocker.tar.gz" -C "$TMP"
 mv "$TMP/lazydocker" "$BIN"
 chmod +x "$BIN"
@@ -128,8 +274,87 @@ EOS
   write_file "$HOME/.local/bin/update-fzf" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
+
+download_with_retry() {
+  local url="$1"
+  local dest="$2"
+  local retries="${3:-3}"
+  local timeout="${4:-30}"
+  local attempt delay
+  local -a extra_opts=()
+  (( $# > 4 )) && extra_opts=("${@:5}")
+
+  if command -v curl >/dev/null 2>&1; then
+    for (( attempt=1; attempt<=retries; attempt++ )); do
+      rm -f "$dest"
+      if curl --fail --location --silent --show-error --connect-timeout "$timeout" --max-time "$((timeout*2))" "${extra_opts[@]}" -o "$dest" "$url"; then
+        return 0
+      fi
+      if (( attempt < retries )); then
+        delay=$(( (2 ** (attempt-1)) * 2 ))
+        sleep "$delay"
+      fi
+    done
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    if (( ${#extra_opts[@]} > 0 )); then
+      echo "Note: wget fallback ignoring extra curl opts: ${extra_opts[*]}" >&2
+    fi
+    for (( attempt=1; attempt<=retries; attempt++ )); do
+      rm -f "$dest"
+      if wget --quiet --timeout="$timeout" --tries=1 -O "$dest" "$url"; then
+        return 0
+      fi
+      if (( attempt < retries )); then
+        delay=$(( (2 ** (attempt-1)) * 2 ))
+        sleep "$delay"
+      fi
+    done
+  fi
+
+  echo "Failed to download $url after $retries attempts" >&2
+  return 1
+}
+
+fetch_with_retry() {
+  local url="$1"
+  local retries="${2:-3}"
+  local timeout="${3:-15}"
+  local -a extra_opts=()
+  if (( $# > 3 )); then
+    extra_opts=("${@:4}")
+  fi
+  local tmp
+  tmp=$(mktemp)
+  trap 'rm -f "$tmp"' RETURN
+  download_with_retry "$url" "$tmp" "$retries" "$timeout" "${extra_opts[@]}"
+  cat "$tmp"
+  trap - RETURN
+  rm -f "$tmp"
+}
+
+if [[ "${1:-}" == "--check" ]]; then
+  if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+    if ! command -v tar >/dev/null 2>&1; then
+      echo "update-fzf: required command 'tar' not found" >&2
+      exit 1
+    fi
+    echo "update-fzf: prerequisites satisfied"
+    exit 0
+  else
+    echo "update-fzf: missing curl or wget" >&2
+    exit 1
+  fi
+fi
+
 BIN="$HOME/.local/bin/fzf"
-LATEST=$(curl -s https://api.github.com/repos/junegunn/fzf/releases/latest | grep -Po '"tag_name": "v\K[0-9.]+' )
+HEADERS=("-H" "Accept: application/vnd.github+json" "-H" "User-Agent: setup-script/${SCRIPT_VERSION:-1.0}")
+if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+  HEADERS+=("-H" "Authorization: Bearer ${GITHUB_TOKEN}")
+fi
+LATEST=$(fetch_with_retry "https://api.github.com/repos/junegunn/fzf/releases/latest" 3 15 "${HEADERS[@]}" | grep -Po '"tag_name": "v\K[0-9.]+' || true)
+[[ -z "$LATEST" ]] && { echo "Unable to determine latest fzf release" >&2; exit 1; }
 CURRENT=""
 [[ -x "$BIN" ]] && CURRENT="$("$BIN" --version 2>/dev/null | awk '{print $1}' || true)"
 [[ "$CURRENT" == "$LATEST" ]] && exit 0
@@ -141,7 +366,7 @@ case "$ARCH" in
 esac
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-curl -L "https://github.com/junegunn/fzf/releases/download/v${LATEST}/fzf-${LATEST}-${FZF_ARCH}.tar.gz" -o "$TMP/fzf.tar.gz"
+download_with_retry "https://github.com/junegunn/fzf/releases/download/v${LATEST}/fzf-${LATEST}-${FZF_ARCH}.tar.gz" "$TMP/fzf.tar.gz" 3 60
 tar -xzf "$TMP/fzf.tar.gz" -C "$TMP"
 mv "$TMP/fzf" "$BIN"
 chmod +x "$BIN"
