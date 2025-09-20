@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_VERSION="1.0.0"
-DEFAULT_MODULE_BASE_URL="https://raw.githubusercontent.com/ivotrompert/installscript/main/lib"
+DEFAULT_MODULE_BASE_URL="https://raw.githubusercontent.com/solidrhino/installscript/main/lib"
 MODULE_BASE_URL="${SETUP_MODULE_BASE_URL:-$DEFAULT_MODULE_BASE_URL}"
 MODULE_CACHE_DIR="$HOME/.cache/setup-script/${SCRIPT_VERSION}"
 MODULES=(core system installers configs timers uninstall)
@@ -108,6 +108,39 @@ CI_MODE=false
 UPDATE_CHECK_ENABLED=true
 MODE_UNINSTALL=0
 MODE_HEALTH=0
+SKIP_TAILSCALE_AUTH=${SKIP_TAILSCALE_AUTH:-false}
+TAILSCALE_AUTH_KEY=${TAILSCALE_AUTH_KEY:-}
+TAILSCALE_TAGS=${TAILSCALE_TAGS:-}
+TAILSCALE_SSH=${TAILSCALE_SSH:-false}
+TAILSCALE_EPHEMERAL=${TAILSCALE_EPHEMERAL:-false}
+TAILSCALE_EXIT_NODE=${TAILSCALE_EXIT_NODE:-false}
+TAILSCALE_INTERACTIVE_AUTH=${TAILSCALE_INTERACTIVE_AUTH:-false}
+SKIP_FISH_DEFAULT=${SKIP_FISH_DEFAULT:-false}
+
+case "${SKIP_TAILSCALE_AUTH,,}" in
+  true|yes|1) SKIP_TAILSCALE_AUTH=true ;;
+  *) SKIP_TAILSCALE_AUTH=false ;;
+esac
+case "${TAILSCALE_SSH,,}" in
+  true|yes|1) TAILSCALE_SSH=true ;;
+  *) TAILSCALE_SSH=false ;;
+esac
+case "${TAILSCALE_EPHEMERAL,,}" in
+  true|yes|1) TAILSCALE_EPHEMERAL=true ;;
+  *) TAILSCALE_EPHEMERAL=false ;;
+esac
+case "${TAILSCALE_EXIT_NODE,,}" in
+  true|yes|1) TAILSCALE_EXIT_NODE=true ;;
+  *) TAILSCALE_EXIT_NODE=false ;;
+esac
+case "${TAILSCALE_INTERACTIVE_AUTH,,}" in
+  true|yes|1) TAILSCALE_INTERACTIVE_AUTH=true ;;
+  *) TAILSCALE_INTERACTIVE_AUTH=false ;;
+esac
+case "${SKIP_FISH_DEFAULT,,}" in
+  true|yes|1) SKIP_FISH_DEFAULT=true ;;
+  *) SKIP_FISH_DEFAULT=false ;;
+esac
 
 show_help() {
   local code=${1:-0}
@@ -122,6 +155,13 @@ Options:
   --ci            Run in CI/CD mode (non-interactive, skip Atuin)
   health          Run system health check and exit
   --update-script Update this script to the latest version and exit
+  --skip-tailscale-auth    Skip Tailscale authentication
+  --tailscale-auth-key=KEY Use the provided Tailscale auth key
+  --tailscale-tags=TAGS    Comma-separated tags to advertise (e.g., tag:ci,tag:prod)
+  --tailscale-ssh          Enable Tailscale SSH during authentication
+  --tailscale-ephemeral    Register this node as ephemeral
+  --tailscale-exit-node    Advertise this node as an exit node
+  --no-fish-default        Install Fish but keep the current login shell
   --help          Show this help message
 
 Environment variables:
@@ -152,6 +192,13 @@ for arg in "$@"; do
         exit 1
       fi
       ;;
+    --skip-tailscale-auth) SKIP_TAILSCALE_AUTH=true ;;
+    --tailscale-auth-key=*) TAILSCALE_AUTH_KEY="${arg#*=}" ;;
+    --tailscale-tags=*) TAILSCALE_TAGS="${arg#*=}" ;;
+    --tailscale-ssh) TAILSCALE_SSH=true ;;
+    --tailscale-ephemeral) TAILSCALE_EPHEMERAL=true ;;
+    --tailscale-exit-node) TAILSCALE_EXIT_NODE=true ;;
+    --no-fish-default) SKIP_FISH_DEFAULT=true ;;
     --help|-h) show_help 0 ;;
     *) log_error "Unknown argument: $arg"; show_help 2 ;;
   esac
@@ -285,6 +332,47 @@ if [[ "$SKIP_ATUIN" == false ]]; then
   fi
 fi
 
+if [[ -n "$TAILSCALE_AUTH_KEY" ]]; then
+  VALIDATION_ERROR=""
+  if ! validate_tailscale_auth_key "$TAILSCALE_AUTH_KEY"; then
+    log_error "Provided Tailscale auth key is invalid: ${VALIDATION_ERROR}"
+    TAILSCALE_AUTH_KEY=""
+  fi
+fi
+
+if [[ -n "$TAILSCALE_TAGS" ]]; then
+  TAILSCALE_TAGS="${TAILSCALE_TAGS// /}"
+  VALIDATION_ERROR=""
+  if ! validate_tailscale_tags "$TAILSCALE_TAGS"; then
+    log_error "Provided Tailscale tags are invalid: ${VALIDATION_ERROR}"
+    TAILSCALE_TAGS=""
+  fi
+fi
+
+if [[ "$SKIP_TAILSCALE_AUTH" != true ]]; then
+  if [[ "$DRY_RUN" == true ]]; then
+    log_info "[Dry-run] Skipping Tailscale authentication configuration."
+    SKIP_TAILSCALE_AUTH=true
+  elif [[ "$CI_MODE" == true && -z "$TAILSCALE_AUTH_KEY" ]]; then
+    log_info "CI mode without Tailscale auth key; skipping Tailscale authentication."
+    SKIP_TAILSCALE_AUTH=true
+  fi
+
+  if [[ "$SKIP_TAILSCALE_AUTH" == false && -z "$TAILSCALE_AUTH_KEY" && "$CI_MODE" == false ]]; then
+    if confirm_action "Authenticate this machine with Tailscale now?" "y" 0 "tailscale_auth"; then
+      TAILSCALE_INTERACTIVE_AUTH=true
+      if confirm_action "Do you want to use a Tailscale auth key?" "y" 0 "tailscale_auth_key"; then
+        if ! TAILSCALE_AUTH_KEY=$(prompt_with_validation "Tailscale auth key" validate_tailscale_auth_key "" 5); then
+          log_error "Unable to capture a valid Tailscale auth key. Proceeding with interactive browser authentication."
+          TAILSCALE_AUTH_KEY=""
+        fi
+      fi
+    else
+      SKIP_TAILSCALE_AUTH=true
+    fi
+  fi
+fi
+
 progress "System Update & Base Dependencies"
 system_update_and_base_deps
 
@@ -296,6 +384,9 @@ install_rust_toolchain
 
 progress "Docker"
 setup_docker
+
+progress "Tailscale"
+install_tailscale
 
 progress "LazyDocker & fzf"
 install_lazydocker_suite

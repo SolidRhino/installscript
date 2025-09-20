@@ -37,7 +37,7 @@ uninstall_all() {
   if [[ "$remove_rust" == true ]]; then
     run "cargo uninstall cargo-update || true"
     local tool
-    for tool in atuin bat bottom du-dust eze fd-find helix starship yazi-fm zoxide; do
+    for tool in atuin bat bottom du-dust eza fd-find helix starship yazi-fm zoxide; do
       run "cargo uninstall $tool || true"
     done
     run "rm -rf $HOME/.cargo $HOME/.rustup"

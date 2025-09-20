@@ -20,7 +20,7 @@ readonly E_UNSUPPORTED_OS=20
 readonly E_UNSUPPORTED_VERSION=21
 readonly E_UNSUPPORTED_ARCH=22
 
-REMOTE_REPO_BASE_URL=${REMOTE_REPO_BASE_URL:-"https://raw.githubusercontent.com/ivotrompert/installscript/main"}
+REMOTE_REPO_BASE_URL=${REMOTE_REPO_BASE_URL:-"https://raw.githubusercontent.com/solidrhino/installscript/main"}
 REMOTE_VERSION_URL=${REMOTE_VERSION_URL:-"${REMOTE_REPO_BASE_URL}/VERSION"}
 REMOTE_SCRIPT_URL=${REMOTE_SCRIPT_URL:-"${REMOTE_REPO_BASE_URL}/setup.sh"}
 
@@ -83,7 +83,11 @@ log_json() {
 #--------------------------------------------
 # Progress Bar
 #--------------------------------------------
-TOTAL_STEPS=9
+if [[ -n "${TOTAL_STEPS_OVERRIDE:-}" && "${TOTAL_STEPS_OVERRIDE}" =~ ^[0-9]+$ && ${TOTAL_STEPS_OVERRIDE} -gt 0 ]]; then
+  TOTAL_STEPS=${TOTAL_STEPS_OVERRIDE}
+else
+  TOTAL_STEPS=10
+fi
 CURRENT_STEP=0
 STEP_START_TIME=0
 CURRENT_STEP_LABEL=""
@@ -812,6 +816,7 @@ verify_installation() {
   check_tool_version "Rust compiler" rustc --version || failures+=("rustc")
   check_tool_version "Cargo" cargo --version || failures+=("cargo")
   check_tool_version "Docker" docker --version || failures+=("docker")
+  check_tool_version "Tailscale" tailscale version || failures+=("tailscale")
   check_tool_version "LazyDocker" lazydocker --version || failures+=("lazydocker")
   check_tool_version "fzf" fzf --version || failures+=("fzf")
 
@@ -914,6 +919,18 @@ health_check() {
       log_error "curl not available for network check."
       log_json "error" "Missing curl for network check" "" "{}"
       issues+=("curl not available")
+    fi
+  fi
+
+  if command -v tailscale >/dev/null 2>&1; then
+    if ! tailscale status >/dev/null 2>&1; then
+      log_error "Tailscale daemon not running"
+      log_info "If this node is new or was logged out, run 'sudo tailscale up' to connect."
+      log_json "error" "Tailscale status failed" "" "{\"hint\":\"run sudo tailscale up\"}"
+      issues+=("Tailscale daemon not running")
+    else
+      log_success "Tailscale daemon running"
+      log_json "info" "Tailscale healthy" "" "{}"
     fi
   fi
 
@@ -1047,6 +1064,49 @@ validate_password() {
     VALIDATION_ERROR="Password must be at least 8 characters."
     return 1
   fi
+  return 0
+}
+
+validate_tailscale_auth_key() {
+  local key="$1"
+  VALIDATION_ERROR=""
+  if [[ -z "$key" ]]; then
+    VALIDATION_ERROR="Tailscale auth key is required."
+    return 1
+  fi
+  if [[ ! $key =~ ^tskey-(auth|reusable)-[A-Za-z0-9]{16,}$ ]]; then
+    VALIDATION_ERROR="Auth key must start with tskey-auth- or tskey-reusable- and contain only base32 characters."
+    return 1
+  fi
+  return 0
+}
+
+validate_tailscale_tags() {
+  local tags="$1"
+  VALIDATION_ERROR=""
+  if [[ -z "$tags" ]]; then
+    return 0
+  fi
+
+  local IFS=','
+  local tag
+  for tag in $tags; do
+    if [[ -z "$tag" ]]; then
+      VALIDATION_ERROR="Tags may not be empty."
+      return 1
+    fi
+    if [[ $tag =~ \  ]]; then
+      VALIDATION_ERROR="Tags may not contain spaces."
+      return 1
+    fi
+    if [[ ! $tag =~ ^[A-Za-z0-9][A-Za-z0-9:_-]{0,62}[A-Za-z0-9]$ ]]; then
+      if [[ ${#tag} -eq 1 && $tag =~ ^[A-Za-z0-9]$ ]]; then
+        continue
+      fi
+      VALIDATION_ERROR="Invalid tag '${tag}'. Tags must be alphanumeric and may include '-', '_', or ':', without leading/trailing punctuation."
+      return 1
+    fi
+  done
   return 0
 }
 

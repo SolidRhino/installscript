@@ -11,8 +11,14 @@ system_update_and_base_deps() {
 install_fish_shell() {
   run "sudo add-apt-repository -y ppa:fish-shell/release-4 || true"
   run "sudo apt update -y && sudo apt install -y fish"
-  if [[ "$(getent passwd "$USER" | cut -d: -f7)" != "/usr/bin/fish" ]]; then
-    run "chsh -s /usr/bin/fish"
+  if [[ "${SKIP_FISH_DEFAULT:-false}" == true ]]; then
+    log_info "Skipping change of default shell to fish as requested."
+  else
+    local current_shell
+    current_shell=$(getent passwd "$USER" | cut -d: -f7)
+    if [[ "$current_shell" != "/usr/bin/fish" ]]; then
+      run "chsh -s /usr/bin/fish"
+    fi
   fi
   run "fish -c 'set -Ux fish_greeting \"\"' || true"
 }
@@ -68,6 +74,126 @@ setup_docker() {
     time_step "Docker repo setup" docker_repo_setup_commands "$docker_key_tmp"
     time_step "Docker packages" docker_package_install
     run "sudo usermod -aG docker $USER"
+  fi
+}
+
+tailscale_repo_setup_commands() {
+  local key_tmp="$1"
+  sudo install -m 0755 -d /usr/share/keyrings
+  # Write keyring; dearmor for consistent binary format
+  sudo gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg "$key_tmp"
+  echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+}
+
+tailscale_package_install() {
+  sudo apt update -y
+  sudo apt install -y tailscale
+}
+
+build_tailscale_up_command() {
+  local include_auth="$1"
+  shift || true
+
+  local -a cmd=(sudo tailscale up)
+
+  if [[ -n "${TAILSCALE_TAGS:-}" ]]; then
+    local tags="${TAILSCALE_TAGS// /}"
+    [[ -n "$tags" ]] && cmd+=("--advertise-tags=${tags}")
+  fi
+  if [[ "${TAILSCALE_SSH:-false}" == true ]]; then
+    cmd+=("--ssh")
+  fi
+  if [[ "${TAILSCALE_EPHEMERAL:-false}" == true ]]; then
+    cmd+=("--ephemeral")
+  fi
+  if [[ "${TAILSCALE_EXIT_NODE:-false}" == true ]]; then
+    cmd+=("--advertise-exit-node")
+  fi
+  if [[ "$include_auth" == true && -n "${TAILSCALE_AUTH_KEY:-}" ]]; then
+    cmd+=("--authkey=${TAILSCALE_AUTH_KEY}")
+  fi
+
+  printf '%s\n' "${cmd[@]}"
+}
+
+configure_tailscale() {
+  if [[ "${SKIP_TAILSCALE_AUTH:-false}" == true ]]; then
+    log_info "Skipping Tailscale authentication as requested."
+    return 0
+  fi
+
+  if [[ "${DRY_RUN:-false}" == true ]]; then
+    log_info "[Dry-run] Would run 'tailscale up' to authenticate."
+    return 0
+  fi
+
+  if ! command -v tailscale >/dev/null 2>&1; then
+    log_error "tailscale CLI not found after installation."
+    return 1
+  fi
+
+  local -a cmd
+  if [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]; then
+    mapfile -t cmd < <(build_tailscale_up_command true)
+    local key_preview="${TAILSCALE_AUTH_KEY:0:6}…"
+    log_info "Authenticating Tailscale using provided auth key (${key_preview})."
+    if ! "${cmd[@]}"; then
+      log_error "Tailscale authentication failed when using auth key. Run 'sudo tailscale up --authkey=***' to retry manually."
+      return 1
+    fi
+    log_success "Tailscale authentication complete."
+    if [[ "${TAILSCALE_EXIT_NODE:-false}" == true ]]; then
+      sysctl -n net.ipv4.ip_forward >/dev/null 2>&1 || true
+      log_info "If exit node routing fails, ensure IP forwarding is enabled (e.g., net.ipv4.ip_forward=1)."
+    fi
+    return 0
+  fi
+
+  if [[ "${TAILSCALE_INTERACTIVE_AUTH:-false}" != true ]]; then
+    log_info "Skipping Tailscale authentication. You can run 'sudo tailscale up' later."
+    return 0
+  fi
+
+  mapfile -t cmd < <(build_tailscale_up_command false)
+  log_info "Starting interactive Tailscale authentication (a browser window may open)."
+  if ! "${cmd[@]}"; then
+    log_error "Interactive Tailscale authentication failed. Run 'sudo tailscale up' to retry."
+    return 1
+  fi
+  log_success "Tailscale authentication complete."
+  if [[ "${TAILSCALE_EXIT_NODE:-false}" == true ]]; then
+    sysctl -n net.ipv4.ip_forward >/dev/null 2>&1 || true
+    log_info "If exit node routing fails, ensure IP forwarding is enabled (e.g., net.ipv4.ip_forward=1)."
+  fi
+  return 0
+}
+
+install_tailscale() {
+  if command -v tailscale &>/dev/null; then
+    log_success "Tailscale already installed"
+  else
+    local tailscale_key_tmp
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+      log_info "[Dry-run] Download Tailscale GPG key"
+      tailscale_key_tmp="/tmp/tailscale.gpg"
+    else
+      tailscale_key_tmp=$(mktemp)
+      TMPDIRS+=("$tailscale_key_tmp")
+      download_with_retry "https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg" "$tailscale_key_tmp" 3 30
+    fi
+    time_step "Tailscale repo setup" tailscale_repo_setup_commands "$tailscale_key_tmp"
+    time_step "Tailscale packages" tailscale_package_install
+  fi
+
+  time_step "Enable tailscaled" sudo systemctl enable --now tailscaled
+
+  if [[ "${SKIP_TAILSCALE_AUTH:-false}" == true ]]; then
+    log_info "Tailscale installed. Run 'sudo tailscale up' to authenticate this machine."
+    return 0
+  fi
+
+  if ! configure_tailscale; then
+    log_error "Tailscale configuration encountered issues. You can run 'sudo tailscale up' manually later."
   fi
 }
 
