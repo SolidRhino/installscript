@@ -24,9 +24,32 @@ REMOTE_REPO_BASE_URL=${REMOTE_REPO_BASE_URL:-"https://raw.githubusercontent.com/
 REMOTE_VERSION_URL=${REMOTE_VERSION_URL:-"${REMOTE_REPO_BASE_URL}/VERSION"}
 REMOTE_SCRIPT_URL=${REMOTE_SCRIPT_URL:-"${REMOTE_REPO_BASE_URL}/setup.sh"}
 
-log_info()    { echo -e "${YELLOW}ℹ️  $*${NC}"; }
-log_success() { echo -e "${GREEN}✅ $*${NC}"; }
-log_error()   { echo -e "${RED}❌ $*${NC}" >&2; }
+log_info() {
+  local message="$*"
+  {
+    printf '%b' "${YELLOW}ℹ️  "
+    printf '%s' "$message"
+    printf '%b\n' "${NC}"
+  } >&2
+}
+
+log_success() {
+  local message="$*"
+  {
+    printf '%b' "${GREEN}✅ "
+    printf '%s' "$message"
+    printf '%b\n' "${NC}"
+  } >&2
+}
+
+log_error() {
+  local message="$*"
+  {
+    printf '%b' "${RED}❌ "
+    printf '%s' "$message"
+    printf '%b\n' "${NC}"
+  } >&2
+}
 
 log_error_exit() {
   local message="$1"
@@ -37,7 +60,11 @@ log_error_exit() {
 }
 
 _json_escape() {
-  local str="$1"
+  local str="${1-}"
+  if [[ -z "${1+x}" || -z "$str" ]]; then
+    printf ''
+    return
+  fi
   str="${str//\\/\\\\}"
   str="${str//\"/\\\"}"
   str="${str//$'\n'/\\n}"
@@ -50,10 +77,13 @@ _json_escape() {
 
 
 log_json() {
-  local level="$1"
-  local message="$2"
+  local level="${1:-info}"
+  local message="${2:-}"
   local step="${3:-${CURRENT_STEP_LABEL:-}}"
   local metadata="${4:-}"
+  if [[ -z "$message" ]]; then
+    message="(no message)"
+  fi
   local timestamp
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
   local level_json message_json payload step_json
@@ -65,7 +95,22 @@ log_json() {
     payload+=",\"step\":\"$step_json\""
   fi
   if [[ -n "$metadata" ]]; then
-    payload+=",\"metadata\":$metadata"
+    local metadata_trimmed="$metadata"
+    metadata_trimmed="${metadata_trimmed#${metadata_trimmed%%[![:space:]]*}}"
+    metadata_trimmed="${metadata_trimmed%${metadata_trimmed##*[![:space:]]}}"
+    if [[ "$metadata_trimmed" == \{* || "$metadata_trimmed" == \[* ]]; then
+      if command -v jq >/dev/null 2>&1 && printf '%s\n' "$metadata" | jq -e . >/dev/null 2>&1; then
+        payload+=",\"metadata\":${metadata}"
+      else
+        local metadata_json
+        metadata_json=$(_json_escape "$metadata")
+        payload+=",\"metadata_raw\":\"$metadata_json\""
+      fi
+    else
+      local metadata_json
+      metadata_json=$(_json_escape "$metadata")
+      payload+=",\"metadata_raw\":\"$metadata_json\""
+    fi
   fi
   payload+="}"
   local log_file=~/setup.json.log
@@ -438,27 +483,90 @@ fetch_with_retry() {
   local tmp
   tmp=$(mktemp)
   TMPDIRS+=("$tmp")
-  download_with_retry "$url" "$tmp" "$retries" "$timeout" "${extra_opts[@]}"
+  ( download_with_retry "$url" "$tmp" "$retries" "$timeout" "${extra_opts[@]}" 1>&2 )
   cat "$tmp"
   rm -f "$tmp"
 }
 
 _version_compare() {
-  local a="$1"
-  local b="$2"
+  local a="${1:-0}"
+  local b="${2:-0}"
+
+  if [[ -z "${a//[[:space:]]/}" ]]; then
+    a=0
+  fi
+  if [[ -z "${b//[[:space:]]/}" ]]; then
+    b=0
+  fi
+
   local IFS='.'
-  local -a a_parts=($a)
-  local -a b_parts=($b)
+  local -a a_parts=()
+  local -a b_parts=()
+  read -r -a a_parts <<<"$a"
+  read -r -a b_parts <<<"$b"
+
   local max=${#a_parts[@]}
-  (( ${#b_parts[@]} > max )) && max=${#b_parts[@]}
+  if [[ ${#b_parts[@]} -gt $max ]]; then
+    max=${#b_parts[@]}
+  fi
+
   local i
   for (( i=0; i<max; i++ )); do
-    local ai=${a_parts[i]:-0}
-    local bi=${b_parts[i]:-0}
-    if (( ai > bi )); then
-      return 1
-    elif (( ai < bi )); then
-      return 2
+    local ai_raw="${a_parts[i]:-0}"
+    local bi_raw="${b_parts[i]:-0}"
+
+    local ai_sanitized="${ai_raw//[^0-9]/}"
+    local bi_sanitized="${bi_raw//[^0-9]/}"
+
+    if [[ "$ai_raw" != "$ai_sanitized" || "$bi_raw" != "$bi_sanitized" ]]; then
+      local meta_ai_raw meta_ai_clean meta_bi_raw meta_bi_clean
+      meta_ai_raw=$(_json_escape "$ai_raw")
+      meta_ai_clean=$(_json_escape "$ai_sanitized")
+      meta_bi_raw=$(_json_escape "$bi_raw")
+      meta_bi_clean=$(_json_escape "$bi_sanitized")
+      log_json "warn" "Sanitized version segment" "" "{\"index\":$i,\"left_raw\":\"$meta_ai_raw\",\"left_clean\":\"$meta_ai_clean\",\"right_raw\":\"$meta_bi_raw\",\"right_clean\":\"$meta_bi_clean\"}"
+    fi
+
+    if [[ "$ai_sanitized" =~ ^[0-9]+$ && "$bi_sanitized" =~ ^[0-9]+$ ]]; then
+      local ai_num bi_num
+      ai_num=$(printf '%d\n' "0${ai_sanitized}") || ai_num=0
+      bi_num=$(printf '%d\n' "0${bi_sanitized}") || bi_num=0
+
+      if [[ "$ai_num" -gt "$bi_num" ]]; then
+        return 1
+      elif [[ "$ai_num" -lt "$bi_num" ]]; then
+        return 2
+      fi
+
+      # Pre-release suffixes (e.g., 3-alpha) sort before the same numeric (3).
+      local left_has_suffix=false
+      local right_has_suffix=false
+      [[ "$ai_raw" != "$ai_sanitized" ]] && left_has_suffix=true
+      [[ "$bi_raw" != "$bi_sanitized" ]] && right_has_suffix=true
+
+      if [[ "$left_has_suffix" == true && "$right_has_suffix" == false ]]; then
+        return 2  # left includes suffix => treated as lower precedence
+      elif [[ "$left_has_suffix" == false && "$right_has_suffix" == true ]]; then
+        return 1  # right includes suffix => left is higher precedence
+      elif [[ "$left_has_suffix" == true && "$right_has_suffix" == true ]]; then
+        # Both carry suffixes; resolve deterministically via lexical comparison.
+        if [[ "$ai_raw" > "$bi_raw" ]]; then
+          return 1
+        elif [[ "$ai_raw" < "$bi_raw" ]]; then
+          return 2
+        fi
+      fi
+    else
+      local meta_ai meta_bi
+      meta_ai=$(_json_escape "$ai_raw")
+      meta_bi=$(_json_escape "$bi_raw")
+      log_json "warn" "Non-numeric version segment" "" "{\"index\":$i,\"left\":\"$meta_ai\",\"right\":\"$meta_bi\"}"
+
+      if [[ "$ai_raw" > "$bi_raw" ]]; then
+        return 1
+      elif [[ "$ai_raw" < "$bi_raw" ]]; then
+        return 2
+      fi
     fi
   done
   return 0
@@ -478,7 +586,7 @@ get_remote_version() {
   fi
 
   local response
-  if ! response=$(fetch_with_retry "$url" 3 15); then
+  if ! response=$(fetch_with_retry "$url" 3 15 2>/dev/null); then
     log_error "Failed to fetch remote version from $url"
     return 1
   fi
